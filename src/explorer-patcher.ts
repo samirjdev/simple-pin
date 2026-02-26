@@ -1,225 +1,308 @@
-import { TFile, WorkspaceLeaf } from "obsidian";
 import type SimplePinPlugin from "./main";
-import type { FileExplorerView, FileItem } from "./types";
 
 /**
  * Patches the File Explorer's sort behaviour so that pinned files
  * always appear at the top of their containing folder while preserving
  * the user's chosen sort order among both pinned and unpinned groups.
  *
+ * KEY APPROACH – prototype-level patching:
+ *   Obsidian's folder tree items share a prototype with a `sort()` method.
+ *   We wrap that prototype method *once* so that EVERY folder (including
+ *   newly created ones and the vault root) automatically runs our
+ *   pin-reorder logic after the original sort.  After rearranging the
+ *   `children` data array we also reorder the DOM by calling
+ *   `appendChild()` which *moves* existing nodes.
+ *
  * Because the File Explorer internals are **not** part of Obsidian's
- * public API, every access is wrapped in defensive checks.  If a
- * future Obsidian update changes the internal structure the patch
- * will simply no-op and log a warning – the rest of the plugin
- * (pinning data, commands, context-menu) will keep working.
+ * public API, every access is wrapped in defensive checks.  If a future
+ * Obsidian update changes the internal structure the patch will simply
+ * no-op and log a warning – the rest of the plugin keeps working.
  */
 export class ExplorerPatcher {
 	private plugin: SimplePinPlugin;
-	/** Keep a reference so we can un-patch on unload */
-	private origSortFns = new WeakMap<object, Function>();
-	private patched = false;
+	/** The prototype we patched (so we can restore it) */
+	private patchedProto: any = null;
+	/** The original, unpatched sort function */
+	private originalSort: Function | null = null;
 
 	constructor(plugin: SimplePinPlugin) {
 		this.plugin = plugin;
 	}
 
-	/* ── public API ──────────────────────────────────── */
+	/* ═══════════════════════════════════════════════
+	 *  Public API
+	 * ═══════════════════════════════════════════════ */
 
-	/**
-	 * Apply (or re-apply) the sort patch and refresh indicators.
-	 * Safe to call repeatedly.
-	 */
+	/** Ensure the sort prototype is patched, trigger a re-sort, and refresh indicators. */
 	patchAndRefresh(): void {
 		try {
-			const explorerLeaf = this.getExplorerLeaf();
-			if (!explorerLeaf) return;
-
-			const view = explorerLeaf.view as unknown as FileExplorerView;
+			const view = this.getExplorerView();
 			if (!view) return;
 
-			this.patchFolderSorts(view);
-			this.requestSort(view);
-			this.updateIndicators(view);
+			this.ensurePatched(view);
+			this.triggerSort(view);
+
+			// Indicators are applied after a short delay so the DOM has
+			// settled from the async requestSort() call.
+			window.setTimeout(() => {
+				try {
+					this.updateIndicators();
+				} catch (_) {
+					/* swallow – non-critical */
+				}
+			}, 60);
 		} catch (e) {
 			console.warn("[Simple Pin] patchAndRefresh failed:", e);
 		}
 	}
 
-	/**
-	 * Refresh sorting + indicators without re-patching
-	 */
+	/** Re-sort + update indicators (prototype already patched). */
 	refresh(): void {
 		try {
-			const explorerLeaf = this.getExplorerLeaf();
-			if (!explorerLeaf) return;
-			const view = explorerLeaf.view as unknown as FileExplorerView;
+			const view = this.getExplorerView();
 			if (!view) return;
-			this.requestSort(view);
-			this.updateIndicators(view);
+			this.triggerSort(view);
+			window.setTimeout(() => {
+				try {
+					this.updateIndicators();
+				} catch (_) {
+					/* swallow */
+				}
+			}, 60);
 		} catch (e) {
 			console.warn("[Simple Pin] refresh failed:", e);
 		}
 	}
 
-	/**
-	 * Remove all patches and indicators.
-	 */
+	/** Restore the original sort method and remove all indicators. */
 	unpatch(): void {
 		try {
-			const explorerLeaf = this.getExplorerLeaf();
-			if (!explorerLeaf) return;
-			const view = explorerLeaf.view as unknown as FileExplorerView;
-			if (!view) return;
-
-			// Remove pin indicators
-			this.removeAllIndicators(view);
-
-			// Restore original sort functions
-			if (view.fileItems) {
-				for (const item of Object.values(view.fileItems)) {
-					if (item && item.sort) {
-						const orig = this.origSortFns.get(item);
-						if (orig) {
-							item.sort = orig as () => void;
-							this.origSortFns.delete(item);
-						}
-					}
-				}
+			if (this.patchedProto && this.originalSort) {
+				this.patchedProto.sort = this.originalSort;
+				this.patchedProto = null;
+				this.originalSort = null;
+				console.log("[Simple Pin] Restored original file-explorer sort().");
 			}
-			this.patched = false;
-
-			this.requestSort(view);
+			this.removeAllIndicators();
+			const view = this.getExplorerView();
+			if (view) this.triggerSort(view);
 		} catch (e) {
 			console.warn("[Simple Pin] unpatch failed:", e);
 		}
 	}
 
-	/* ── patching internals ──────────────────────────── */
-
-	private getExplorerLeaf(): WorkspaceLeaf | null {
-		const leaves =
-			this.plugin.app.workspace.getLeavesOfType("file-explorer");
-		return leaves[0] ?? null;
-	}
+	/* ═══════════════════════════════════════════════
+	 *  Sort-prototype patching
+	 * ═══════════════════════════════════════════════ */
 
 	/**
-	 * Walk every folder item in the explorer and monkey-patch
-	 * its `sort()` method so that pinned children come first.
+	 * Find a folder item in the explorer, grab its shared prototype,
+	 * and wrap `prototype.sort()` so every folder benefits from the
+	 * pinning logic.  Safe to call repeatedly — patches only once.
 	 */
-	private patchFolderSorts(view: FileExplorerView): void {
-		if (!view.fileItems) {
-			console.warn("[Simple Pin] fileItems not found on explorer view.");
+	private ensurePatched(view: any): void {
+		if (this.patchedProto) return; // already done
+
+		const folderItem = this.findFolderItem(view);
+		if (!folderItem) {
+			console.warn(
+				"[Simple Pin] No folder item found in file explorer — " +
+					"cannot patch sort(). Pinning will persist but the " +
+					"UI order will not change.",
+			);
 			return;
 		}
 
-		for (const [, item] of Object.entries(view.fileItems)) {
-			if (!item || !item.file || !("children" in item.file)) continue; // not a folder
-			if (!item.sort || typeof item.sort !== "function") continue;
-
-			// Avoid double-patching
-			if (this.origSortFns.has(item)) continue;
-
-			const origSort = item.sort.bind(item);
-			this.origSortFns.set(item, origSort);
-
-			// eslint-disable-next-line @typescript-eslint/no-this-alias
-			const patcher = this;
-
-			item.sort = function (this: FileItem) {
-				try {
-					// Run the original sort first (applies Obsidian's chosen sort order)
-					origSort();
-
-					const children = this.children;
-					if (!children || children.length === 0) return;
-
-					const pinnedSet = patcher.plugin.pinManager.getPinnedPaths();
-					if (pinnedSet.size === 0) return;
-
-					const pinned: FileItem[] = [];
-					const unpinned: FileItem[] = [];
-
-					for (const child of children) {
-						if (
-							child?.file &&
-							pinnedSet.has(child.file.path)
-						) {
-							pinned.push(child);
-						} else {
-							unpinned.push(child);
-						}
-					}
-
-					if (pinned.length === 0) return;
-
-					// Reorder: pinned first (in their current sorted order), then unpinned
-					children.length = 0;
-					children.push(...pinned, ...unpinned);
-				} catch (e) {
-					console.warn("[Simple Pin] sort patch error:", e);
-					// Fallback: just run the original
-					origSort();
-				}
-			};
+		const proto = Object.getPrototypeOf(folderItem);
+		if (!proto || typeof proto.sort !== "function") {
+			console.warn(
+				"[Simple Pin] Folder item prototype has no sort() method.",
+			);
+			return;
 		}
 
-		this.patched = true;
+		// Save originals so we can un-patch later
+		const origSort = proto.sort;
+		this.originalSort = origSort;
+		this.patchedProto = proto;
+
+		// Capture `this` (ExplorerPatcher) for use inside the patched fn.
+		// eslint-disable-next-line @typescript-eslint/no-this-alias
+		const patcher = this;
+
+		// ── The actual patch ────────────────────────────────────────
+		// `this` inside the function below will be the *folder item*
+		// calling sort(), NOT the ExplorerPatcher.
+		proto.sort = function (this: any) {
+			// Step 1 — run Obsidian's original sort (honours the user's
+			//          chosen sort mode: alphabetical, by date, etc.)
+			origSort.call(this);
+
+			// Step 2 — move pinned children to the front
+			try {
+				patcher.reorderFolder(this);
+			} catch (e) {
+				console.warn("[Simple Pin] reorderFolder error:", e);
+			}
+		};
+
+		console.log(
+			"[Simple Pin] Patched file-explorer sort() on prototype.",
+		);
+	}
+
+	/* ═══════════════════════════════════════════════
+	 *  Per-folder reorder (data array + DOM)
+	 * ═══════════════════════════════════════════════ */
+
+	/**
+	 * Given a folder tree item whose children have just been sorted by
+	 * Obsidian, partition them into [pinned…, unpinned…] preserving
+	 * relative order within each group, then rewrite the array in-place
+	 * and reorder the corresponding DOM nodes.
+	 */
+	private reorderFolder(folderItem: any): void {
+		// Obsidian stores child items in different locations across
+		// versions — try each known path defensively.
+		const children: any[] | undefined =
+			folderItem.vChildren?._children ?? // Obsidian ≥ 1.6+
+			folderItem.vChildren?.children ?? // alternate layout
+			folderItem.children; // older versions
+
+		if (!children || children.length < 2) return;
+
+		const pinnedSet = this.plugin.pinManager.getPinnedPaths();
+		if (pinnedSet.size === 0) return;
+
+		const pinned: any[] = [];
+		const unpinned: any[] = [];
+
+		for (const child of children) {
+			const path: string | undefined = child?.file?.path;
+			if (path !== undefined && pinnedSet.has(path)) {
+				pinned.push(child);
+			} else {
+				unpinned.push(child);
+			}
+		}
+
+		if (pinned.length === 0) return;
+
+		// ── Rewrite the children array in-place ──────────────────
+		const merged = [...pinned, ...unpinned];
+		for (let i = 0; i < merged.length; i++) {
+			children[i] = merged[i];
+		}
+
+		// ── Reorder DOM to match ─────────────────────────────────
+		// `appendChild` on an existing child node *moves* it to the
+		// end of its parent.  By appending in the new order we
+		// rearrange the visible tree without creating / destroying
+		// elements.
+		for (const child of children) {
+			const el: HTMLElement | undefined = child?.el;
+			if (el?.parentElement) {
+				el.parentElement.appendChild(el);
+			}
+		}
+	}
+
+	/* ═══════════════════════════════════════════════
+	 *  Helpers
+	 * ═══════════════════════════════════════════════ */
+
+	/** Return the first file-explorer leaf's view, or null. */
+	private getExplorerView(): any | null {
+		const leaves =
+			this.plugin.app.workspace.getLeavesOfType("file-explorer");
+		return leaves[0]?.view ?? null;
 	}
 
 	/**
-	 * Trigger the explorer to re-sort.
+	 * Walk `view.fileItems` to find any folder item (i.e. one whose
+	 * `.file` is a TFolder and that has a `sort` method).  We only
+	 * need one — we patch its prototype which is shared by all.
 	 */
-	private requestSort(view: FileExplorerView): void {
+	private findFolderItem(view: any): any | null {
+		const items: Record<string, any> | undefined = view?.fileItems;
+		if (!items) return null;
+
+		for (const key of Object.keys(items)) {
+			const it = items[key];
+			if (
+				it?.file &&
+				"children" in it.file && // TFolder has a `children` property
+				typeof it.sort === "function"
+			) {
+				return it;
+			}
+		}
+
+		// Fallback: the root tree item might be separate
+		const root = view.tree;
+		if (root && typeof root.sort === "function") return root;
+
+		return null;
+	}
+
+	/** Ask the explorer to re-sort all folders (async/queued internally). */
+	private triggerSort(view: any): void {
 		if (typeof view.requestSort === "function") {
 			view.requestSort();
 		}
 	}
 
-	/* ── indicator management ────────────────────────── */
+	/* ═══════════════════════════════════════════════
+	 *  Pin indicators (📌 prefix)
+	 * ═══════════════════════════════════════════════ */
 
-	private static readonly INDICATOR_CLS = "simple-pin-indicator";
+	private static readonly CLS = "simple-pin-indicator";
 
-	updateIndicators(view: FileExplorerView): void {
-		if (!view.fileItems) return;
+	/** Add or remove 📌 indicators based on current pin state + settings. */
+	updateIndicators(): void {
+		const view = this.getExplorerView();
+		const items: Record<string, any> | undefined = view?.fileItems;
+		if (!items) return;
 
 		const show = this.plugin.settings.showPinIndicator;
 		const pinnedSet = this.plugin.pinManager.getPinnedPaths();
 
-		for (const [path, item] of Object.entries(view.fileItems)) {
+		for (const [path, item] of Object.entries(items)) {
 			if (!item) continue;
 
-			// Find the title element. Obsidian stores it in different places
-			// depending on version — try several.
-			const titleEl: HTMLElement | null | undefined =
+			// Obsidian stores the title element under varying names.
+			const titleEl: HTMLElement | undefined =
 				item.selfEl ?? item.innerEl ?? item.el;
 			if (!titleEl) continue;
 
-			// Remove any existing indicator
-			const existing = titleEl.querySelector(
-				`.${ExplorerPatcher.INDICATOR_CLS}`,
-			);
-			if (existing) existing.remove();
+			// Remove any existing indicator first
+			titleEl
+				.querySelector(`.${ExplorerPatcher.CLS}`)
+				?.remove();
 
 			if (show && pinnedSet.has(path)) {
-				const indicator = createSpan({
-					cls: ExplorerPatcher.INDICATOR_CLS,
-					text: "\u{1F4CC} ", // 📌 + space
+				const span = createSpan({
+					cls: ExplorerPatcher.CLS,
+					text: "\u{1F4CC} ", // 📌 + thin space
 				});
-				titleEl.prepend(indicator);
+				titleEl.prepend(span);
 			}
 		}
 	}
 
-	private removeAllIndicators(view: FileExplorerView): void {
-		if (!view.fileItems) return;
-		for (const item of Object.values(view.fileItems)) {
+	/** Strip all indicators from every item. */
+	removeAllIndicators(): void {
+		const view = this.getExplorerView();
+		const items: Record<string, any> | undefined = view?.fileItems;
+		if (!items) return;
+
+		for (const item of Object.values(items)) {
 			if (!item) continue;
-			const titleEl = item.selfEl ?? item.innerEl ?? item.el;
-			if (!titleEl) continue;
-			const existing = titleEl.querySelector(
-				`.${ExplorerPatcher.INDICATOR_CLS}`,
-			);
-			if (existing) existing.remove();
+			const el: HTMLElement | undefined =
+				(item as any).selfEl ??
+				(item as any).innerEl ??
+				(item as any).el;
+			el?.querySelector(`.${ExplorerPatcher.CLS}`)?.remove();
 		}
 	}
 }
