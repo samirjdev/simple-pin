@@ -1,6 +1,6 @@
 {
 	"name": "simple-pin",
-	"version": "0.1.0",
+	"version": "0.1.2",
 	"description": "Pin files to the top of their folder in the Obsidian File Explorer.",
 	"main": "main.js",
 	"type": "module",
