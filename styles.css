@@ -1,0 +1,15 @@
+/*
+ * Simple Pin – styles
+ *
+ * Provides subtle styling for the pin indicator shown in
+ * the File Explorer next to pinned files.
+ */
+
+.simple-pin-indicator {
+	display: inline;
+	font-size: 0.85em;
+	opacity: 0.8;
+	margin-right: 2px;
+	pointer-events: none;
+	user-select: none;
+}

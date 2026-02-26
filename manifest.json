@@ -1,0 +1,10 @@
+{
+	"id": "simple-pin",
+	"name": "Simple Pin",
+	"version": "0.1.0",
+	"minAppVersion": "0.15.0",
+	"description": "Pin files to the top of their folder in the File Explorer sidebar.",
+	"author": "samirjdev",
+	"authorUrl": "https://github.com/samirjdev",
+	"isDesktopOnly": false
+}
